@@ -4,3 +4,6 @@ output/*
 .pixi/
 checkpoint1_files/
 .Rhistory
+
+/.quarto/
+**/*.quarto_ipynb

@@ -1,0 +1,855 @@
+---
+title: "BIOSTAT 707 Checkpoint 1: Cohort Characterization and EDA"
+author: "Jiahui Hu (jh1029)"
+date: now
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: false
+engine: knitr
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+```{r}
+#| label: setup
+#| message: false
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(gtsummary)
+  library(knitr)
+})
+
+here::i_am("checkpoint1.qmd")
+
+data_dir     <- here::here("data")
+set_a_dir    <- here::here("data", "set-a")
+outcomes_csv <- here::here("data", "Outcomes-a.txt")
+out_dir      <- here::here("output")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+expected_n <- 4000L
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+)
+```
+
+# Reproducible data checks
+
+```{r}
+#| label: check-data
+
+check_set_a <- function(set_a_dir, outcomes_csv, expected_n = 4000L) {
+  if (!dir.exists(set_a_dir)) {
+    stop(
+      "Missing directory: ", set_a_dir,
+      "\nExpected 4000 files under data/set-a/."
+    )
+  }
+
+  if (!file.exists(outcomes_csv)) {
+    stop("Missing outcomes file: ", outcomes_csv)
+  }
+
+  files <- sort(list.files(
+    set_a_dir,
+    pattern = "^[0-9]+\\.txt$",
+    full.names = TRUE
+  ))
+
+  if (length(files) != expected_n) {
+    stop(
+      "Expected ", expected_n, " patient files in data/set-a/, but found ",
+      length(files), "."
+    )
+  }
+
+  files
+}
+
+set_a_files <- check_set_a(set_a_dir, outcomes_csv, expected_n)
+```
+
+# Load and combine the 4,000 skinny files
+
+Each source file contains a pseudo-measurement whose `Parameter` is
+`RecordID`. I use that row only to verify the filename, then remove it and keep
+`RecordID` as an identifier column. This is important: if the pseudo-measurement
+is allowed into `pivot_wider()`, it attempts to create a new column named
+`RecordID` next to the existing identifier column and produces the duplicated
+name error.
+
+```{r}
+#| label: load-set-a
+
+time_to_minutes <- function(x) {
+  pieces <- strsplit(x, ":", fixed = TRUE)
+  vapply(
+    pieces,
+    function(z) {
+      if (length(z) != 2L) return(NA_real_)
+      hour <- suppressWarnings(as.numeric(z[[1]]))
+      minute <- suppressWarnings(as.numeric(z[[2]]))
+      if (is.na(hour) || is.na(minute)) return(NA_real_)
+      60 * hour + minute
+    },
+    numeric(1)
+  )
+}
+
+load_one_record <- function(path) {
+  record_id_from_file <- suppressWarnings(as.integer(
+    sub("\\.txt$", "", basename(path))
+  ))
+
+  if (is.na(record_id_from_file)) {
+    stop("Could not obtain RecordID from filename: ", path)
+  }
+
+  x <- data.table::fread(
+    path,
+    sep = ",",
+    header = TRUE,
+    showProgress = FALSE
+  )
+
+  names(x) <- trimws(names(x))
+  required <- c("Time", "Parameter", "Value")
+  if (!all(required %in% names(x))) {
+    stop("File does not contain Time, Parameter, and Value: ", path)
+  }
+
+  x[, Parameter := trimws(as.character(Parameter))]
+  x[, Time := trimws(as.character(Time))]
+  x[, Value := suppressWarnings(as.numeric(Value))]
+
+  embedded_id <- x[Parameter == "RecordID", Value]
+  if (length(embedded_id) != 1L ||
+      is.na(embedded_id[[1]]) ||
+      as.integer(embedded_id[[1]]) != record_id_from_file) {
+    stop("RecordID row does not match filename in: ", path)
+  }
+
+  # Critical fix for the duplicated RecordID error.
+  x <- x[Parameter != "RecordID"]
+  x[, RecordID := record_id_from_file]
+
+  x[, .(
+    RecordID,
+    Time,
+    Minutes = time_to_minutes(Time),
+    Parameter,
+    Value_raw = Value
+  )]
+}
+
+long_raw <- data.table::rbindlist(
+  lapply(set_a_files, load_one_record),
+  use.names = TRUE,
+  fill = FALSE
+) |>
+  as_tibble()
+
+if (anyNA(long_raw$Minutes)) {
+  bad_times <- unique(long_raw$Time[is.na(long_raw$Minutes)])
+  stop("Unparseable time value(s): ", paste(bad_times, collapse = ", "))
+}
+
+stopifnot(
+  "RecordID must not remain as a Parameter" =
+    !any(long_raw$Parameter == "RecordID"),
+  "The long table must contain 4,000 records" =
+    n_distinct(long_raw$RecordID) == expected_n
+)
+```
+
+```{r}
+#| label: load-outcomes
+
+outcomes <- readr::read_csv(
+  outcomes_csv,
+  show_col_types = FALSE,
+  progress = FALSE
+)
+
+# Normalize punctuation in names, e.g. SAPS-I -> SAPS_I and
+# In-hospital_death -> In_hospital_death.
+names(outcomes) <- gsub("[^A-Za-z0-9]+", "_", names(outcomes))
+names(outcomes) <- gsub("_+$", "", names(outcomes))
+
+required_outcomes <- c(
+  "RecordID", "SAPS_I", "SOFA", "Length_of_stay",
+  "Survival", "In_hospital_death"
+)
+
+if (!all(required_outcomes %in% names(outcomes))) {
+  stop(
+    "Outcomes-a.txt is missing required columns. Found: ",
+    paste(names(outcomes), collapse = ", ")
+  )
+}
+
+outcomes <- outcomes |>
+  mutate(
+    RecordID = as.integer(RecordID),
+    In_hospital_death = as.integer(In_hospital_death)
+  )
+
+stopifnot(
+  "Outcomes must contain one row per record" =
+    !anyDuplicated(outcomes$RecordID),
+  "Outcomes must contain 4,000 records" =
+    nrow(outcomes) == expected_n,
+  "Measurement and outcome IDs must agree" =
+    setequal(long_raw$RecordID, outcomes$RecordID),
+  "Death outcome must be coded 0/1" =
+    all(outcomes$In_hospital_death %in% c(0L, 1L))
+)
+
+id_frame <- outcomes |>
+  distinct(RecordID) |>
+  arrange(RecordID)
+```
+
+# Data-quality decisions
+
+The value `-1` is the dataset's missing-value sentinel, so I convert it to an
+R missing value. I also screen selected variables using deliberately broad
+bounds. These are data-quality bounds, not normal clinical reference ranges.
+Values outside them are retained in `Value_raw`, flagged, and excluded only
+from numerical summaries through `Value_clean`. This makes the handling of
+questionable values auditable rather than silently deleting source rows.
+
+```{r}
+#| label: clean-values
+
+quality_bounds <- tribble(
+  ~Parameter,    ~lower, ~upper,
+  "Age",             0,    130,
+  "Gender",          0,      1,
+  "Height",         50,    250,
+  "ICUType",         1,      4,
+  "Weight",         20,    400,
+  "Albumin",         0,     20,
+  "ALP",             0,   5000,
+  "ALT",             0,  20000,
+  "AST",             0,  20000,
+  "Bilirubin",       0,    100,
+  "BUN",             0,    300,
+  "Cholesterol",     0,   1000,
+  "Creatinine",      0,     30,
+  "DiasABP",         0,    250,
+  "FiO2",            0,      1,
+  "GCS",             3,     15,
+  "Glucose",         0,   2000,
+  "HCO3",            0,    100,
+  "HCT",             0,    100,
+  "HR",              0,    300,
+  "K",               0,     15,
+  "Lactate",         0,     40,
+  "MAP",             0,    250,
+  "MechVent",        0,      1,
+  "Mg",              0,     20,
+  "Na",             80,    220,
+  "NIDiasABP",       0,    250,
+  "NIMAP",           0,    250,
+  "NISysABP",        0,    300,
+  "PaCO2",           0,    300,
+  "PaO2",            0,    800,
+  "pH",              0,     14,
+  "Platelets",       0,   2000,
+  "RespRate",        0,    100,
+  "SaO2",            0,    100,
+  "SysABP",          0,    300,
+  "Temp",           25,     45,
+  "TroponinI",       0,   1000,
+  "TroponinT",       0,   1000,
+  "Urine",           0,  10000,
+  "WBC",             0,    500
+)
+
+long <- long_raw |>
+  left_join(quality_bounds, by = "Parameter") |>
+  mutate(
+    is_sentinel_missing = !is.na(Value_raw) & Value_raw == -1,
+    Value = if_else(is_sentinel_missing, NA_real_, Value_raw),
+    is_nonfinite = !is.na(Value) & !is.finite(Value),
+    is_implausible =
+      !is.na(Value) & !is.na(lower) & !is.na(upper) &
+      (Value < lower | Value > upper),
+    quality_issue = case_when(
+      is_nonfinite ~ "non-finite",
+      is_implausible ~ "outside broad data-quality bound",
+      TRUE ~ NA_character_
+    ),
+    Value_clean = if_else(is_nonfinite | is_implausible, NA_real_, Value)
+  ) |>
+  arrange(RecordID, Minutes, Parameter)
+
+quality_summary <- long |>
+  filter(!is.na(quality_issue)) |>
+  count(Parameter, quality_issue, name = "flagged_rows", sort = TRUE)
+
+if (nrow(quality_summary) == 0L) {
+  quality_summary <- tibble(
+    Parameter = "None",
+    quality_issue = "No values were flagged",
+    flagged_rows = 0L
+  )
+}
+
+knitr::kable(
+  quality_summary,
+  caption = "Values flagged by the transparent data-quality rules"
+)
+```
+
+```{r}
+#| label: write-long
+
+set_a_long <- long |>
+  select(
+    RecordID, Time, Minutes, Parameter,
+    Value_raw, Value, Value_clean,
+    is_sentinel_missing, is_implausible, quality_issue
+  )
+
+readr::write_csv(
+  set_a_long,
+  file.path(out_dir, "set-a_long.csv"),
+  na = ""
+)
+```
+
+The combined table contains `r format(nrow(set_a_long), big.mark = ",")`
+measurement rows from `r n_distinct(set_a_long$RecordID)` ICU stays and
+`r n_distinct(set_a_long$Parameter)` measured parameters.
+
+# What exists at prediction time
+
+The prediction window consists of measurements recorded during the first 48
+hours of the ICU stay. The outcome variables in `Outcomes-a.txt` are used here
+only to describe the cohort and investigate associations; they are not
+predictors available at the prediction time. To retain timing while creating a
+one-row-per-stay table, I summarize repeated measurements separately in two
+landmark windows: 0--24 hours and 24--48 hours.
+
+No outcome-based imputation or feature selection is performed in this
+checkpoint. Absence of a measurement may reflect both patient physiology and
+the clinical team's decision to order a test, so missingness indicators are
+preserved rather than immediately imputed away.
+
+# Baseline cohort and Table 1
+
+```{r}
+#| label: create-static
+
+first_nonmissing <- function(x) {
+  y <- x[!is.na(x)]
+  if (length(y) == 0L) NA_real_ else y[[1]]
+}
+
+static_parameters <- c("Age", "Gender", "Height", "ICUType", "Weight")
+
+static <- long |>
+  filter(Parameter %in% static_parameters) |>
+  arrange(RecordID, Minutes) |>
+  group_by(RecordID, Parameter) |>
+  summarise(Value = first_nonmissing(Value_clean), .groups = "drop") |>
+  pivot_wider(
+    id_cols = RecordID,
+    names_from = Parameter,
+    values_from = Value,
+    names_repair = "check_unique"
+  ) |>
+  right_join(id_frame, by = "RecordID") |>
+  arrange(RecordID)
+
+table1_data <- static |>
+  left_join(outcomes, by = "RecordID") |>
+  mutate(
+    Gender = factor(
+      Gender,
+      levels = c(0, 1),
+      labels = c("Female", "Male")
+    ),
+    ICUType = factor(
+      ICUType,
+      levels = c(1, 2, 3, 4),
+      labels = c(
+        "Coronary care unit",
+        "Cardiac surgery recovery unit",
+        "Medical ICU",
+        "Surgical ICU"
+      )
+    ),
+    In_hospital_death = factor(
+      In_hospital_death,
+      levels = c(0, 1),
+      labels = c("Survived", "Died")
+    )
+  )
+```
+
+```{r}
+#| label: table1
+
+table1_data |>
+  select(
+    In_hospital_death,
+    Age, Gender, ICUType, Height, Weight, SAPS_I, SOFA
+  ) |>
+  gtsummary::tbl_summary(
+    by = In_hospital_death,
+    missing = "ifany",
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      Age ~ "Age (years)",
+      Gender ~ "Sex",
+      ICUType ~ "ICU type",
+      Height ~ "Height (cm)",
+      Weight ~ "Weight (kg)",
+      SAPS_I ~ "SAPS-I",
+      SOFA ~ "SOFA"
+    )
+  ) |>
+  gtsummary::add_overall(last = FALSE) |>
+  gtsummary::bold_labels() |>
+  gtsummary::modify_caption(
+    "**Table 1. Baseline cohort characteristics by in-hospital outcome**"
+  )
+```
+
+# Outcome summary
+
+```{r}
+#| label: outcome-summary
+
+outcome_summary <- outcomes |>
+  summarise(
+    Records = n(),
+    Deaths = sum(In_hospital_death == 1L),
+    `Death rate (%)` = 100 * mean(In_hospital_death == 1L),
+    `Length of stay, median` = median(Length_of_stay, na.rm = TRUE),
+    `Length of stay, Q1` = quantile(Length_of_stay, 0.25, na.rm = TRUE),
+    `Length of stay, Q3` = quantile(Length_of_stay, 0.75, na.rm = TRUE),
+    `SAPS-I, median` = median(SAPS_I, na.rm = TRUE),
+    `SOFA, median` = median(SOFA, na.rm = TRUE)
+  ) |>
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+
+knitr::kable(
+  outcome_summary,
+  caption = "Overall outcome and severity summary"
+)
+```
+
+There were `r sum(outcomes$In_hospital_death == 1L)` in-hospital deaths among
+`r nrow(outcomes)` stays, corresponding to a mortality proportion of
+`r sprintf("%.1f%%", 100 * mean(outcomes$In_hospital_death == 1L))`.
+
+```{r}
+#| label: outcome-plot
+#| fig-width: 7
+#| fig-height: 4
+
+outcomes |>
+  count(In_hospital_death) |>
+  mutate(
+    Outcome = if_else(
+      In_hospital_death == 1L,
+      "Died in hospital",
+      "Survived to discharge"
+    ),
+    Percent = 100 * n / sum(n)
+  ) |>
+  ggplot(aes(x = Outcome, y = Percent, fill = Outcome)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", Percent)),
+    vjust = -0.4
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(x = NULL, y = "Percent of ICU stays", title = "In-hospital outcome")
+```
+
+# Build the landmark-stacked wide table
+
+```{r}
+#| label: build-wide
+
+# Age, Gender, Height, and ICUType are baseline descriptors. Weight can be
+# repeated, so it remains in the longitudinal summaries as well as Table 1.
+nonlongitudinal_parameters <- c("Age", "Gender", "Height", "ICUType")
+
+analysis_long <- long |>
+  filter(
+    between(Minutes, 0, 48 * 60),
+    !Parameter %in% nonlongitudinal_parameters,
+    !is.na(Value_clean)
+  ) |>
+  mutate(
+    Window = if_else(Minutes < 24 * 60, "h00_24", "h24_48")
+  ) |>
+  arrange(RecordID, Parameter, Window, Minutes)
+
+summary_long <- analysis_long |>
+  group_by(RecordID, Parameter, Window) |>
+  summarise(
+    count = n(),
+    first = dplyr::first(Value_clean),
+    last = dplyr::last(Value_clean),
+    min = min(Value_clean),
+    max = max(Value_clean),
+    mean = mean(Value_clean),
+    .groups = "drop"
+  )
+
+duplicate_keys <- summary_long |>
+  count(RecordID, Parameter, Window, name = "rows") |>
+  filter(rows > 1L)
+
+stopifnot(
+  "RecordID must never be expanded from Parameter" =
+    !any(summary_long$Parameter == "RecordID"),
+  "Each RecordID/Parameter/window key must be unique" =
+    nrow(duplicate_keys) == 0L
+)
+
+wide_ts <- summary_long |>
+  pivot_wider(
+    id_cols = RecordID,
+    names_from = c(Parameter, Window),
+    values_from = c(count, first, last, min, max, mean),
+    names_glue = "{Parameter}_{Window}_{.value}",
+    names_sort = TRUE,
+    names_repair = "check_unique"
+  )
+
+set_a_wide <- id_frame |>
+  left_join(static, by = "RecordID") |>
+  left_join(wide_ts, by = "RecordID") |>
+  left_join(outcomes, by = "RecordID")
+
+# A count of zero is meaningful; other summaries remain NA when unmeasured.
+count_columns <- grep("_count$", names(set_a_wide), value = TRUE)
+set_a_wide <- set_a_wide |>
+  mutate(across(all_of(count_columns), ~ replace_na(.x, 0)))
+
+stopifnot(
+  "Wide table must have 4,000 rows" = nrow(set_a_wide) == expected_n,
+  "Wide table must have one row per RecordID" =
+    !anyDuplicated(set_a_wide$RecordID),
+  "Wide-table column names must be unique" =
+    !anyDuplicated(names(set_a_wide))
+)
+
+readr::write_csv(
+  set_a_wide,
+  file.path(out_dir, "set-a_wide.csv"),
+  na = ""
+)
+```
+
+The wide table has `r nrow(set_a_wide)` rows and `r ncol(set_a_wide)` columns.
+It contains one row per ICU stay, baseline descriptors, outcomes, and separate
+0--24-hour and 24--48-hour summaries for repeated measurements.
+
+# Missingness using temporal information
+
+For each six-hour block, the heat map below shows the percentage of the 4,000
+stays with at least one valid observation. A blank test is therefore treated as
+an absence of measurement, not as a numeric zero.
+
+```{r}
+#| label: temporal-missingness-data
+
+time_labels <- c(
+  "00-06h", "06-12h", "12-18h", "18-24h",
+  "24-30h", "30-36h", "36-42h", "42-48h"
+)
+
+measured_by_block <- long |>
+  filter(
+    between(Minutes, 0, 48 * 60),
+    !Parameter %in% nonlongitudinal_parameters,
+    !is.na(Value_clean)
+  ) |>
+  mutate(
+    Time_block = cut(
+      Minutes,
+      breaks = c(seq(0, 42 * 60, by = 6 * 60), 48 * 60 + 1),
+      labels = time_labels,
+      right = FALSE,
+      include.lowest = TRUE
+    )
+  ) |>
+  distinct(RecordID, Parameter, Time_block)
+
+parameter_order <- measured_by_block |>
+  count(Parameter, name = "observed_patient_blocks") |>
+  arrange(observed_patient_blocks) |>
+  pull(Parameter)
+
+temporal_missingness <- measured_by_block |>
+  count(Parameter, Time_block, name = "records_measured") |>
+  complete(
+    Parameter,
+    Time_block = factor(time_labels, levels = time_labels),
+    fill = list(records_measured = 0L)
+  ) |>
+  mutate(
+    percent_measured = 100 * records_measured / expected_n,
+    Parameter = factor(Parameter, levels = parameter_order),
+    Time_block = factor(Time_block, levels = time_labels)
+  )
+```
+
+```{r}
+#| label: missingness-by-time
+#| fig-width: 10
+#| fig-height: 9
+
+ggplot(
+  temporal_missingness,
+  aes(x = Time_block, y = Parameter, fill = percent_measured)
+) +
+  geom_tile(color = "white", linewidth = 0.15) +
+  scale_fill_viridis_c(
+    option = "C",
+    limits = c(0, 100),
+    name = "% measured"
+  ) +
+  labs(
+    x = "Hours after ICU admission",
+    y = NULL,
+    title = "Availability of measurements over the first 48 hours",
+    subtitle = "Each cell is the percent of stays with at least one valid value"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+# Missingness in the wide table
+
+The next graph uses the numerical summary columns rather than the count
+columns. Counts are explicitly zero when no value was measured; `first`,
+`last`, `min`, `max`, and `mean` remain missing in that situation.
+
+```{r}
+#| label: wide-missingness-data
+
+summary_value_columns <- grep(
+  "_(first|last|min|max|mean)$",
+  names(set_a_wide),
+  value = TRUE
+)
+
+wide_missingness <- tibble(
+  Variable = summary_value_columns,
+  Missing_percent = 100 * vapply(
+    set_a_wide[summary_value_columns],
+    function(x) mean(is.na(x)),
+    numeric(1)
+  )
+) |>
+  arrange(desc(Missing_percent))
+
+top_wide_missingness <- wide_missingness |>
+  slice_head(n = 30L) |>
+  mutate(Variable = factor(Variable, levels = rev(Variable)))
+
+patient_missingness <- tibble(
+  RecordID = set_a_wide$RecordID,
+  Missing_percent = 100 * rowMeans(is.na(set_a_wide[summary_value_columns]))
+)
+```
+
+```{r}
+#| label: wide-missingness-plot
+#| fig-width: 10
+#| fig-height: 8
+
+ggplot(top_wide_missingness, aes(x = Missing_percent, y = Variable)) +
+  geom_col(fill = "#3B82A0") +
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(
+    x = "Missing ICU stays (%)",
+    y = NULL,
+    title = "Thirty most-missing summary features in set-a_wide.csv"
+  )
+```
+
+```{r}
+#| label: patient-missingness-plot
+#| fig-width: 8
+#| fig-height: 4.5
+
+ggplot(patient_missingness, aes(x = Missing_percent)) +
+  geom_histogram(binwidth = 2.5, boundary = 0, fill = "#5B8E7D", color = "white") +
+  labs(
+    x = "Missing summary features per ICU stay (%)",
+    y = "Number of ICU stays",
+    title = "Patient-level burden of missingness"
+  )
+```
+
+# Is missingness informative?
+
+To examine whether measurement decisions carry outcome information, I compare
+the death rate between stays in which each variable was ever measured during
+the first 48 hours and stays in which it was never measured. This is a
+descriptive association, not a causal effect: ordering a test may reflect
+illness severity, clinical workflow, or both.
+
+```{r}
+#| label: missingness-outcome-association
+
+dynamic_parameters <- sort(unique(analysis_long$Parameter))
+
+measurement_flags <- long |>
+  filter(
+    between(Minutes, 0, 48 * 60),
+    Parameter %in% dynamic_parameters,
+    !is.na(Value_clean)
+  ) |>
+  distinct(RecordID, Parameter) |>
+  mutate(ever_measured = TRUE)
+
+measurement_grid <- tidyr::crossing(
+  RecordID = id_frame$RecordID,
+  Parameter = dynamic_parameters
+) |>
+  left_join(measurement_flags, by = c("RecordID", "Parameter")) |>
+  mutate(ever_measured = replace_na(ever_measured, FALSE)) |>
+  left_join(
+    outcomes |> select(RecordID, In_hospital_death),
+    by = "RecordID"
+  )
+
+death_by_measurement <- measurement_grid |>
+  group_by(Parameter, ever_measured) |>
+  summarise(
+    n = n(),
+    deaths = sum(In_hospital_death == 1L),
+    death_rate = mean(In_hospital_death == 1L),
+    .groups = "drop"
+  ) |>
+  complete(
+    Parameter,
+    ever_measured = c(FALSE, TRUE),
+    fill = list(n = 0L, deaths = 0L, death_rate = NA_real_)
+  )
+
+death_association <- death_by_measurement |>
+  pivot_wider(
+    id_cols = Parameter,
+    names_from = ever_measured,
+    values_from = c(n, deaths, death_rate),
+    names_sep = "_",
+    names_repair = "check_unique"
+  ) |>
+  mutate(
+    death_rate_difference = death_rate_TRUE - death_rate_FALSE
+  ) |>
+  arrange(desc(abs(death_rate_difference)))
+
+readr::write_csv(
+  death_association,
+  file.path(out_dir, "missingness_outcome_association.csv"),
+  na = ""
+)
+
+death_association |>
+  filter(n_FALSE >= 20L, n_TRUE >= 20L) |>
+  transmute(
+    Parameter,
+    `Never measured, n` = n_FALSE,
+    `Measured, n` = n_TRUE,
+    `Death rate, never measured (%)` = round(100 * death_rate_FALSE, 1),
+    `Death rate, measured (%)` = round(100 * death_rate_TRUE, 1),
+    `Difference (percentage points)` =
+      round(100 * death_rate_difference, 1)
+  ) |>
+  slice_head(n = 20L) |>
+  knitr::kable(
+    caption = paste(
+      "Variables with the largest absolute difference in death rate by",
+      "whether they were measured (groups with at least 20 stays)"
+    )
+  )
+```
+
+These differences show that missingness is not simply random noise. They do
+not establish that measuring a variable changes mortality. More plausibly,
+test ordering and monitoring intensity encode information about patient
+severity, ICU workflow, and treatment decisions. In later predictive work,
+missingness indicators may therefore be useful features, but all imputation
+and feature construction must be learned inside each training fold to avoid
+information leakage.
+
+# Output validation
+
+```{r}
+#| label: validate-output
+
+required_outputs <- c(
+  file.path(out_dir, "set-a_long.csv"),
+  file.path(out_dir, "set-a_wide.csv")
+)
+
+stopifnot(
+  "Required CSV outputs were not created" = all(file.exists(required_outputs)),
+  "Long output is empty" = file.info(required_outputs[[1]])$size > 0,
+  "Wide output is empty" = file.info(required_outputs[[2]])$size > 0
+)
+
+tibble(
+  Output = basename(required_outputs),
+  Rows = c(nrow(set_a_long), nrow(set_a_wide)),
+  Columns = c(ncol(set_a_long), ncol(set_a_wide)),
+  `Size (MB)` = round(file.info(required_outputs)$size / 1024^2, 2)
+) |>
+  knitr::kable(caption = "Required derived data products")
+```
+
+# AI-use statement
+
+<!-- IMPORTANT: Edit this paragraph so it truthfully describes what YOU did. -->
+
+I used OpenAI Codex to help diagnose a duplicated-column-name error in
+`pivot_wider()`, draft boilerplate for reproducible file loading and validation,
+and explain several R operations. The main benefit was faster debugging and a
+clearer set of defensive checks. The main risk was that generated code could
+make incorrect assumptions about variable meaning or silently mishandle
+missing values. I reviewed the code line by line, checked the data dimensions
+and identifiers, inspected the generated tables and figures, and rendered the
+document using the locked pixi environment. I revised the generated suggestions
+where needed and remain responsible for the analysis and interpretation.
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessioninfo::session_info()
+```
