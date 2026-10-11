@@ -8,4 +8,6 @@ checkpoint2_files/
 .Rhistory
 
 /.quarto/
+.DS_Store
+*.incomplete-backup
 **/*.quarto_ipynb
