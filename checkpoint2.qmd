@@ -1,0 +1,1497 @@
+---
+title: "BIOSTAT 707 Checkpoint 2: Feature Engineering and Supervised Modeling"
+author: "Jiahui Hu (jh1029)"
+date: now
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: false
+engine: knitr
+execute:
+  echo: true
+  warning: false
+  error: false
+---
+
+# AI-use statement
+
+I used OpenAI Codex to assist with translating the assignment requirements into
+an analysis workflow, drafting portions of the R code, and troubleshooting
+implementation errors. I ran the complete analysis, reviewed the code, tables,
+figures, and statistical interpretations, and verified that the required
+cross-validation and data-use constraints were followed. I take responsibility
+for the final submission and conclusions.
+
+```{r}
+#| label: setup
+#| message: false
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(glmnet)
+  library(mgcv)
+  library(ranger)
+  library(pROC)
+  library(knitr)
+})
+
+here::i_am("checkpoint2.qmd")
+set.seed(70702)
+
+data_dir     <- here::here("data")
+set_a_dir    <- here::here("data", "set-a")
+outcomes_csv <- here::here("data", "Outcomes-a.txt")
+out_dir      <- here::here("output")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+expected_n <- 4000L
+outer_k <- 5L
+inner_k <- 3L
+rare_measurement_threshold <- 0.10
+lambda_grid <- 10^seq(0, -4, length.out = 30)
+rf_num_trees <- 250L
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+)
+```
+
+# 2.1 Modeling table
+
+Checkpoint 2 uses **set-a only**. The modeling table has one row per ICU stay,
+so no stay can appear in both training and validation within a fold. Repeated
+measurements are summarized over hours 0--48. The binary outcome is
+in-hospital death from `Outcomes-a.txt`.
+
+The data are from the PhysioNet/Computing in Cardiology Challenge 2012,
+“Predicting Mortality of ICU Patients” (Silva, Moody, Scott, Celi, and Mark,
+2012), released under the Open Data Commons Attribution License. The dataset
+and its attribution information are available from
+[PhysioNet](https://physionet.org/content/challenge-2012/1.0.0/), and the study
+description is available from
+[PubMed Central](https://pmc.ncbi.nlm.nih.gov/articles/PMC3965265/).
+
+```{r}
+#| label: check-and-load-data
+
+if (!dir.exists(set_a_dir)) stop("Missing data/set-a/")
+if (!file.exists(outcomes_csv)) stop("Missing data/Outcomes-a.txt")
+
+set_a_files <- sort(list.files(
+  set_a_dir,
+  pattern = "^[0-9]+\\.txt$",
+  full.names = TRUE
+))
+
+if (length(set_a_files) != expected_n) {
+  stop("Expected 4000 set-a files; found ", length(set_a_files))
+}
+
+time_to_minutes <- function(x) {
+  parts <- strsplit(x, ":", fixed = TRUE)
+  vapply(parts, function(z) {
+    if (length(z) != 2L) return(NA_real_)
+    60 * as.numeric(z[[1]]) + as.numeric(z[[2]])
+  }, numeric(1))
+}
+
+load_one_record <- function(path) {
+  file_id <- as.integer(sub("\\.txt$", "", basename(path)))
+  x <- data.table::fread(path, showProgress = FALSE)
+  names(x) <- trimws(names(x))
+  stopifnot(all(c("Time", "Parameter", "Value") %in% names(x)))
+  x[, Parameter := trimws(as.character(Parameter))]
+  x[, Time := trimws(as.character(Time))]
+  x[, Value := as.numeric(Value)]
+
+  embedded_id <- x[Parameter == "RecordID", Value]
+  if (length(embedded_id) != 1L || as.integer(embedded_id[[1]]) != file_id) {
+    stop("RecordID does not match filename: ", path)
+  }
+
+  x <- x[Parameter != "RecordID"]
+  x[, RecordID := file_id]
+  x[, .(
+    RecordID,
+    Time,
+    Minutes = time_to_minutes(Time),
+    Parameter,
+    Value_raw = Value
+  )]
+}
+
+long_raw <- data.table::rbindlist(
+  lapply(set_a_files, load_one_record),
+  use.names = TRUE
+) |>
+  as_tibble()
+
+if (anyNA(long_raw$Minutes)) stop("At least one Time value could not be parsed")
+
+outcomes <- readr::read_csv(
+  outcomes_csv,
+  show_col_types = FALSE,
+  progress = FALSE
+)
+names(outcomes) <- gsub("[^A-Za-z0-9]+", "_", names(outcomes))
+names(outcomes) <- gsub("_+$", "", names(outcomes))
+
+required_outcomes <- c(
+  "RecordID", "SAPS_I", "SOFA", "Length_of_stay",
+  "Survival", "In_hospital_death"
+)
+if (!all(required_outcomes %in% names(outcomes))) {
+  stop("Unexpected Outcomes-a.txt columns")
+}
+
+outcomes <- outcomes |>
+  mutate(
+    RecordID = as.integer(RecordID),
+    In_hospital_death = as.integer(In_hospital_death)
+  )
+
+stopifnot(
+  nrow(outcomes) == expected_n,
+  !anyDuplicated(outcomes$RecordID),
+  setequal(long_raw$RecordID, outcomes$RecordID),
+  all(outcomes$In_hospital_death %in% c(0L, 1L))
+)
+```
+
+The cleaning rules carry forward the Checkpoint 1 decisions. The sentinel
+value -1 is treated as missing. Zero or clearly impossible height and weight
+values and selected measurements outside deliberately broad data-quality
+bounds are retained in the raw column but excluded from model summaries. These
+bounds are screens for obvious data problems, not clinical reference ranges.
+
+```{r}
+#| label: clean-data
+
+quality_bounds <- tribble(
+  ~Parameter,    ~lower, ~upper,
+  "Age",             0,    130,
+  "Gender",          0,      1,
+  "Height",         50,    250,
+  "ICUType",         1,      4,
+  "Weight",         20,    400,
+  "Albumin",         0,     20,
+  "ALP",             0,   5000,
+  "ALT",             0,  20000,
+  "AST",             0,  20000,
+  "Bilirubin",       0,    100,
+  "BUN",             0,    300,
+  "Cholesterol",     0,   1000,
+  "Creatinine",      0,     30,
+  "DiasABP",         0,    250,
+  "FiO2",            0,      1,
+  "GCS",             3,     15,
+  "Glucose",         0,   2000,
+  "HCO3",            0,    100,
+  "HCT",             0,    100,
+  "HR",              0,    300,
+  "K",               0,     15,
+  "Lactate",         0,     40,
+  "MAP",             0,    250,
+  "MechVent",        0,      1,
+  "Mg",              0,     20,
+  "Na",             80,    220,
+  "NIDiasABP",       0,    250,
+  "NIMAP",           0,    250,
+  "NISysABP",        0,    300,
+  "PaCO2",           0,    300,
+  "PaO2",            0,    800,
+  "pH",              0,     14,
+  "Platelets",       0,   2000,
+  "RespRate",        0,    100,
+  "SaO2",            0,    100,
+  "SysABP",          0,    300,
+  "Temp",           25,     45,
+  "TroponinI",       0,   1000,
+  "TroponinT",       0,   1000,
+  "Urine",           0,  10000,
+  "WBC",             0,    500
+)
+
+long <- long_raw |>
+  left_join(quality_bounds, by = "Parameter") |>
+  mutate(
+    Value = if_else(Value_raw == -1, NA_real_, Value_raw),
+    implausible =
+      !is.na(Value) & !is.na(lower) & !is.na(upper) &
+      (Value < lower | Value > upper),
+    Value_clean = if_else(implausible | !is.finite(Value), NA_real_, Value)
+  ) |>
+  arrange(RecordID, Minutes, Parameter)
+
+first_nonmissing <- function(x) {
+  y <- x[!is.na(x)]
+  if (length(y) == 0L) NA_real_ else y[[1]]
+}
+
+static_parameters <- c("Age", "Gender", "Height", "ICUType", "Weight")
+
+static <- long |>
+  filter(Parameter %in% static_parameters) |>
+  group_by(RecordID, Parameter) |>
+  summarise(Value = first_nonmissing(Value_clean), .groups = "drop") |>
+  pivot_wider(
+    id_cols = RecordID,
+    names_from = Parameter,
+    values_from = Value,
+    names_repair = "check_unique"
+  )
+
+long_48 <- long |>
+  filter(
+    between(Minutes, 0, 48 * 60),
+    !Parameter %in% static_parameters,
+    !is.na(Value_clean)
+  )
+
+parameter_availability <- long_48 |>
+  distinct(RecordID, Parameter) |>
+  count(Parameter, name = "stays_measured") |>
+  mutate(
+    percent_measured = 100 * stays_measured / expected_n,
+    keep = stays_measured / expected_n >= rare_measurement_threshold
+  ) |>
+  arrange(percent_measured)
+
+kept_parameters <- parameter_availability |>
+  filter(keep) |>
+  pull(Parameter)
+
+all_dynamic_parameters <- parameter_availability$Parameter
+
+dropped_parameters <- parameter_availability |>
+  filter(!keep) |>
+  select(Parameter, stays_measured, percent_measured)
+```
+
+```{r}
+#| label: create-modeling-table
+
+slope_or_na <- function(time_minutes, value) {
+  if (length(value) < 2L || n_distinct(time_minutes) < 2L) return(NA_real_)
+  unname(coef(lm(value ~ I(time_minutes / 60)))[[2]])
+}
+
+dynamic_summary <- long_48 |>
+  arrange(RecordID, Parameter, Minutes) |>
+  group_by(RecordID, Parameter) |>
+  summarise(
+    count = n(),
+    last = dplyr::last(Value_clean),
+    min = min(Value_clean),
+    max = max(Value_clean),
+    mean = mean(Value_clean),
+    slope = slope_or_na(Minutes, Value_clean),
+    never = 0L,
+    .groups = "drop"
+  ) |>
+  pivot_wider(
+    id_cols = RecordID,
+    names_from = Parameter,
+    values_from = c(count, last, min, max, mean, slope, never),
+    names_glue = "{Parameter}_{.value}",
+    names_sort = TRUE,
+    names_repair = "check_unique"
+  )
+
+count_columns <- grep("_count$", names(dynamic_summary), value = TRUE)
+never_columns <- grep("_never$", names(dynamic_summary), value = TRUE)
+
+dynamic_summary <- dynamic_summary |>
+  mutate(
+    across(all_of(count_columns), ~ replace_na(.x, 0)),
+    across(all_of(never_columns), ~ replace_na(.x, 1))
+  )
+
+modeling_table <- outcomes |>
+  select(
+    RecordID, In_hospital_death, SAPS_I, SOFA,
+    Length_of_stay, Survival
+  ) |>
+  left_join(static, by = "RecordID") |>
+  left_join(dynamic_summary, by = "RecordID") |>
+  arrange(RecordID)
+
+stopifnot(
+  nrow(modeling_table) == expected_n,
+  !anyDuplicated(modeling_table$RecordID),
+  all(modeling_table$In_hospital_death %in% c(0L, 1L))
+)
+
+cohort_summary <- modeling_table |>
+  summarise(
+    `ICU stays` = n(),
+    Deaths = sum(In_hospital_death),
+    `Deaths (%)` = round(100 * mean(In_hospital_death), 1)
+  )
+
+knitr::kable(cohort_summary, caption = "Checkpoint 2 modeling cohort")
+```
+
+The modeling table contains `r nrow(modeling_table)` unique ICU stays and
+`r sum(modeling_table$In_hospital_death)` deaths
+(`r sprintf('%.1f%%', 100 * mean(modeling_table$In_hospital_death))`).
+
+# 2.2 Predictors
+
+All predictors use information available by hour 48. `Length_of_stay` and
+`Survival` are excluded because they occur after the prediction window.
+`RecordID` is an identifier, and SAPS-I and SOFA are held out as benchmark
+risk scores rather than supplied to any model. ICU type is represented with
+separate indicator columns, not as a numeric 1--4 trend.
+
+```{r}
+#| label: predictor-table
+
+predictor_group_table <- tibble(
+  `Predictor group` = c(
+    "Baseline continuous",
+    "Baseline categorical",
+    "Last observed value",
+    "Minimum and maximum",
+    "Mean",
+    "Linear slope",
+    "Measurement count",
+    "Never-measured indicator"
+  ),
+  `Number before one-hot encoding` = c(
+    3L, 2L,
+    length(kept_parameters),
+    2L * length(kept_parameters),
+    length(kept_parameters),
+    length(kept_parameters),
+    length(kept_parameters),
+    length(kept_parameters)
+  ),
+  `Clinical or modeling reason` = c(
+    "Age, height, and initial weight describe baseline reserve and body size.",
+    "Sex and ICU type capture broad patient and care-context differences.",
+    "The latest value approximates physiologic state near the prediction time.",
+    "Extremes capture instability that a mean can hide.",
+    "The mean summarizes overall burden during the observation window.",
+    "A slope captures improvement or deterioration over time.",
+    "Monitoring intensity can encode severity and care decisions.",
+    "Missingness itself may be informative in clinical data."
+  )
+)
+
+predictor_group_table <- bind_rows(
+  predictor_group_table,
+  tibble(
+    `Predictor group` = "Total before one-hot encoding",
+    `Number before one-hot encoding` =
+      sum(predictor_group_table$`Number before one-hot encoding`),
+    `Clinical or modeling reason` =
+      "Total across all prespecified predictor groups."
+  )
+)
+
+knitr::kable(
+  predictor_group_table,
+  caption = paste(
+    "Predictor groups for the final all-set-a refit;", length(kept_parameters),
+    "longitudinal variables passed the availability threshold"
+  )
+)
+```
+
+The table shows that the design combines physiologic level, extremes, trend,
+and measurement behavior rather than relying on a single summary. Counts and
+never-measured indicators explicitly retain clinically informative missingness.
+
+Variables measured in fewer than
+`r sprintf('%.0f%%', 100 * rare_measurement_threshold)` of stays are excluded
+from a fitted model because their numerical summaries would be almost entirely
+imputed. To prevent information from a held-out fold affecting predictor
+selection, this threshold is recalculated separately inside every outer and
+inner training fold and then applied unchanged to that fold's validation data.
+For the final model refit only, the threshold is calculated on all set-a; the
+table below lists the variables excluded from that final refit.
+
+```{r}
+#| label: dropped-variables
+
+if (nrow(dropped_parameters) == 0L) {
+  dropped_display <- tibble(
+    Parameter = "None",
+    stays_measured = expected_n,
+    percent_measured = 100
+  )
+} else {
+  dropped_display <- dropped_parameters |>
+    mutate(percent_measured = round(percent_measured, 1))
+}
+
+knitr::kable(
+  dropped_display,
+  caption = "Variables excluded from the final all-set-a refit for being measured in fewer than 10% of stays"
+)
+```
+
+The table makes the availability rule auditable: listed variables are too
+sparse for reliable numeric summaries in the final refit, while variables not
+listed passed the stated 10% threshold. Fold-specific retained sets may differ
+slightly because each cross-validation decision uses training stays only.
+
+```{r}
+#| label: fixed-domain-encoding
+
+# Fixed, clinically defined levels avoid learning category meanings from the
+# full data. Missing static fields receive explicit indicators and are then
+# median-imputed inside each training fold.
+design_table <- modeling_table |>
+  mutate(
+    Age_missing = as.integer(is.na(Age)),
+    Height_missing = as.integer(is.na(Height)),
+    Weight_missing = as.integer(is.na(Weight)),
+    Gender_Male = if_else(is.na(Gender), NA_real_, as.numeric(Gender == 1)),
+    Gender_missing = as.integer(is.na(Gender)),
+    ICUType_1_CCU = as.numeric(ICUType == 1),
+    ICUType_2_CSRU = as.numeric(ICUType == 2),
+    ICUType_3_MICU = as.numeric(ICUType == 3),
+    ICUType_4_SICU = as.numeric(ICUType == 4),
+    ICUType_missing = as.integer(is.na(ICUType))
+  ) |>
+  select(-Gender, -ICUType)
+
+excluded_columns <- c(
+  "RecordID", "In_hospital_death", "SAPS_I", "SOFA",
+  "Length_of_stay", "Survival"
+)
+predictor_columns <- setdiff(names(design_table), excluded_columns)
+x_raw <- as.data.frame(design_table[predictor_columns])
+y <- design_table$In_hospital_death
+
+stopifnot(
+  !any(c("RecordID", "SAPS_I", "SOFA", "Length_of_stay", "Survival") %in%
+         names(x_raw)),
+  all(vapply(x_raw, is.numeric, logical(1)))
+)
+```
+
+After fixed one-hot encoding and explicit indicators for missing baseline
+fields, the candidate LASSO and random-forest design matrix contains
+`r ncol(x_raw)` columns before fold-specific availability filtering.
+
+# 2.3 Cross-validation design
+
+I use stratified 5-fold cross-validation (CV), with the same fold assignment
+for every model and benchmark. Each outer validation fold is untouched until
+the selected configuration is evaluated. Within every outer training fold,
+missing values are imputed from that training fold only; LASSO predictors are
+also centered and scaled using training-fold values only. The 10% measurement-
+availability screen is fitted inside each training fold, including each inner
+fold, and only that training-derived column set is applied to validation data.
+Hyperparameters are selected with an additional stratified 3-fold CV inside
+the outer training fold. Thus the reported outer-fold AUROCs are not used to
+tune the models or select predictors.
+
+```{r}
+#| label: cv-helpers
+
+make_stratified_folds <- function(y, k, seed) {
+  set.seed(seed)
+  fold <- integer(length(y))
+  for (class_value in sort(unique(y))) {
+    idx <- sample(which(y == class_value))
+    fold[idx] <- rep(seq_len(k), length.out = length(idx))
+  }
+  fold
+}
+
+dynamic_summary_suffixes <- c(
+  "count", "last", "min", "max", "mean", "slope", "never"
+)
+
+dynamic_feature_names <- as.vector(outer(
+  all_dynamic_parameters,
+  dynamic_summary_suffixes,
+  paste,
+  sep = "_"
+))
+
+select_training_predictors <- function(x) {
+  x <- as.data.frame(x)
+  retained_parameters <- all_dynamic_parameters[vapply(
+    all_dynamic_parameters,
+    function(parameter) {
+      count_name <- paste0(parameter, "_count")
+      count_name %in% names(x) &&
+        mean(replace_na(x[[count_name]], 0) > 0) >=
+          rare_measurement_threshold
+    },
+    logical(1)
+  )]
+
+  retained_dynamic <- as.vector(outer(
+    retained_parameters,
+    dynamic_summary_suffixes,
+    paste,
+    sep = "_"
+  ))
+
+  static_columns <- setdiff(names(x), dynamic_feature_names)
+  unique(c(static_columns, intersect(retained_dynamic, names(x))))
+}
+
+fit_preprocessor <- function(x, scale = TRUE) {
+  x <- as.data.frame(x)
+  medians <- vapply(x, function(z) {
+    if (all(is.na(z))) 0 else median(z, na.rm = TRUE)
+  }, numeric(1))
+
+  imputed <- x
+  for (nm in names(imputed)) {
+    imputed[[nm]][is.na(imputed[[nm]])] <- medians[[nm]]
+  }
+
+  sds <- vapply(imputed, sd, numeric(1))
+  keep <- names(sds)[is.finite(sds) & sds > 0]
+  imputed <- imputed[keep]
+  centers <- vapply(imputed, mean, numeric(1))
+  scales <- vapply(imputed, sd, numeric(1))
+
+  list(
+    medians = medians,
+    keep = keep,
+    centers = centers,
+    scales = scales,
+    scale = scale
+  )
+}
+
+apply_preprocessor <- function(prep, x) {
+  x <- as.data.frame(x)
+  x <- x[names(prep$medians)]
+  for (nm in names(x)) {
+    x[[nm]][is.na(x[[nm]])] <- prep$medians[[nm]]
+  }
+  x <- x[prep$keep]
+  if (prep$scale) {
+    x <- sweep(as.matrix(x), 2, prep$centers, "-")
+    x <- sweep(x, 2, prep$scales, "/")
+    return(x)
+  }
+  as.data.frame(x)
+}
+
+safe_auc <- function(truth, score) {
+  ok <- is.finite(score) & !is.na(truth)
+  if (length(unique(truth[ok])) < 2L) return(NA_real_)
+  as.numeric(pROC::auc(pROC::roc(
+    response = truth[ok],
+    predictor = score[ok],
+    levels = c(0, 1),
+    direction = "<",
+    quiet = TRUE
+  )))
+}
+
+outer_fold <- make_stratified_folds(y, outer_k, seed = 70702)
+
+fold_balance <- tibble(
+  Fold = outer_fold,
+  Death = y
+) |>
+  group_by(Fold) |>
+  summarise(
+    Stays = n(),
+    Deaths = sum(Death),
+    `Death rate (%)` = round(100 * mean(Death), 1),
+    .groups = "drop"
+  )
+
+knitr::kable(fold_balance, caption = "Shared stratified outer folds")
+```
+
+The fold-balance table shows nearly identical numbers of stays and deaths in
+each held-out fold, so model comparisons are not driven by different outcome
+prevalence or different patient splits.
+
+# 2.4 Model 1: LASSO logistic regression
+
+I use least absolute shrinkage and selection operator (LASSO) logistic
+regression. LASSO is appropriate here because the feature table is wide and
+contains correlated summaries of the same physiologic signals. The L1 penalty
+shrinks weak coefficients to zero, providing both regularization and a compact
+model. All inputs are placed on a common scale within each training fold.
+
+```{r}
+#| label: lasso-functions
+
+tune_lasso <- function(x, y, inner_fold, lambdas) {
+  oof <- matrix(NA_real_, nrow = nrow(x), ncol = length(lambdas))
+
+  for (j in sort(unique(inner_fold))) {
+    tr <- inner_fold != j
+    va <- inner_fold == j
+    inner_keep <- select_training_predictors(x[tr, , drop = FALSE])
+    prep <- fit_preprocessor(
+      x[tr, inner_keep, drop = FALSE],
+      scale = TRUE
+    )
+    x_tr <- apply_preprocessor(
+      prep,
+      x[tr, inner_keep, drop = FALSE]
+    )
+    x_va <- apply_preprocessor(
+      prep,
+      x[va, inner_keep, drop = FALSE]
+    )
+
+    fit <- glmnet::glmnet(
+      x = x_tr,
+      y = y[tr],
+      family = "binomial",
+      alpha = 1,
+      lambda = lambdas,
+      standardize = FALSE
+    )
+
+    oof[va, ] <- as.matrix(predict(
+      fit,
+      newx = x_va,
+      type = "response",
+      s = lambdas
+    ))
+  }
+
+  aucs <- vapply(seq_along(lambdas), function(i) {
+    safe_auc(y, oof[, i])
+  }, numeric(1))
+
+  best <- which.max(aucs)
+  list(lambda = lambdas[[best]], auc = aucs[[best]], all_auc = aucs)
+}
+
+fit_lasso_outer <- function(x_train, y_train, x_test, fold_number) {
+  inner_fold <- make_stratified_folds(
+    y_train,
+    inner_k,
+    seed = 72000 + fold_number
+  )
+  tuning <- tune_lasso(x_train, y_train, inner_fold, lambda_grid)
+  outer_keep <- select_training_predictors(x_train)
+  prep <- fit_preprocessor(x_train[outer_keep], scale = TRUE)
+  x_tr <- apply_preprocessor(prep, x_train[outer_keep])
+  x_te <- apply_preprocessor(prep, x_test[outer_keep])
+  fit <- glmnet::glmnet(
+    x_tr, y_train,
+    family = "binomial",
+    alpha = 1,
+    lambda = tuning$lambda,
+    standardize = FALSE
+  )
+  prediction <- as.numeric(predict(
+    fit, newx = x_te, type = "response", s = tuning$lambda
+  ))
+  beta <- as.matrix(coef(fit, s = tuning$lambda))[, 1]
+  selected <- setdiff(names(beta)[beta != 0], "(Intercept)")
+  list(
+    prediction = prediction,
+    fit = fit,
+    prep = prep,
+    lambda = tuning$lambda,
+    selected = selected,
+    n_predictors = ncol(x_tr)
+  )
+}
+```
+
+The inner search evaluates 30 penalty values from
+`r format(min(lambda_grid), scientific = TRUE)` to
+`r format(max(lambda_grid), scientific = TRUE)`.
+
+# 2.5 Model 2: generalized additive model
+
+The generalized additive model (GAM) uses 14 clinically selected continuous
+summaries rather than the full feature set. They cover baseline risk,
+circulation, respiration, neurologic status, renal/metabolic function,
+inflammation, and urine output. Cubic regression splines with four basis
+functions allow modest non-linearity while limiting overfitting. Missingness
+indicators and ICU-type indicators enter linearly. Smoothing penalties are
+estimated by restricted maximum likelihood (REML) within each training fold.
+
+```{r}
+#| label: gam-functions
+
+gam_continuous_candidates <- c(
+  "Age", "Weight", "HR_mean", "Temp_mean", "MAP_mean",
+  "RespRate_mean", "GCS_last", "Creatinine_mean", "BUN_mean",
+  "Glucose_mean", "Lactate_mean", "WBC_mean", "Platelets_mean",
+  "Urine_mean"
+)
+
+gam_linear_candidates <- c(
+  "Gender_Male", "Gender_missing",
+  "ICUType_1_CCU", "ICUType_2_CSRU", "ICUType_3_MICU",
+  "ICUType_4_SICU", "ICUType_missing",
+  "Lactate_never", "Urine_never", "GCS_never",
+  "Lactate_count", "Urine_count"
+)
+
+gam_continuous <- intersect(gam_continuous_candidates, names(x_raw))
+gam_linear <- intersect(gam_linear_candidates, names(x_raw))
+gam_features <- unique(c(gam_continuous, gam_linear))
+
+if (length(gam_continuous) < 10L) {
+  stop("Too few prespecified GAM continuous predictors are available")
+}
+
+make_gam_formula <- function(continuous, linear) {
+  smooth_terms <- paste0("s(", continuous, ", k = 4, bs = 'cr')")
+  rhs <- paste(c(smooth_terms, linear), collapse = " + ")
+  as.formula(paste("outcome ~", rhs))
+}
+
+fit_gam_outer <- function(x_train, y_train, x_test) {
+  training_keep <- select_training_predictors(x_train)
+  fold_features <- intersect(gam_features, training_keep)
+  x_train <- x_train[fold_features]
+  x_test <- x_test[fold_features]
+  prep <- fit_preprocessor(x_train, scale = FALSE)
+  tr <- apply_preprocessor(prep, x_train)
+  te <- apply_preprocessor(prep, x_test)
+  continuous_used <- intersect(gam_continuous, names(tr))
+  linear_used <- intersect(gam_linear, names(tr))
+  if (length(continuous_used) < 10L) {
+    stop("Fewer than 10 prespecified GAM predictors passed the training-fold availability rule")
+  }
+  fold_gam_formula <- make_gam_formula(continuous_used, linear_used)
+  train_data <- data.frame(outcome = y_train, tr, check.names = FALSE)
+  fit <- mgcv::gam(
+    fold_gam_formula,
+    data = train_data,
+    family = binomial(),
+    method = "REML",
+    select = TRUE
+  )
+  prediction <- as.numeric(predict(
+    fit,
+    newdata = data.frame(te, check.names = FALSE),
+    type = "response"
+  ))
+  list(
+    prediction = prediction,
+    fit = fit,
+    prep = prep,
+    n_predictors = ncol(tr)
+  )
+}
+
+gam_selection_table <- tibble(
+  Predictor = c(gam_continuous, gam_linear),
+  Role = c(
+    rep("Spline term", length(gam_continuous)),
+    rep("Linear/context or missingness term", length(gam_linear))
+  )
+)
+
+knitr::kable(
+  gam_selection_table,
+  caption = "Clinically prespecified predictors used in the GAM"
+)
+```
+
+The table shows the deliberately smaller GAM specification: clinically central
+continuous variables receive spline terms, while care context and selected
+missingness measures enter linearly. This keeps the nonlinear model readable
+while covering the main physiologic domains.
+
+# 2.6 Model 3: random forest
+
+The tree ensemble is a probability random forest. It uses the same full
+predictor set as LASSO. Missing values are median-imputed within each training
+fold because `ranger` does not use missingness natively in this specification;
+explicit counts and never-measured indicators remain available to the model.
+The number of trees is fixed at `r rf_num_trees`; inner CV searches three
+feature-subsampling values and two minimum node sizes.
+
+```{r}
+#| label: random-forest-functions
+
+make_rf_grid <- function(p) {
+  mtry_values <- unique(pmax(1L, pmin(
+    p,
+    as.integer(round(c(sqrt(p), p / 10, p / 5)))
+  )))
+  expand.grid(
+    mtry = mtry_values,
+    min.node.size = c(5L, 20L),
+    KEEP.OUT.ATTRS = FALSE
+  )
+}
+
+fit_one_rf <- function(x, y, mtry, min_node, seed) {
+  ranger::ranger(
+    x = as.data.frame(x),
+    y = factor(y, levels = c(0, 1)),
+    probability = TRUE,
+    num.trees = rf_num_trees,
+    mtry = mtry,
+    min.node.size = min_node,
+    importance = "impurity",
+    num.threads = 2,
+    seed = seed
+  )
+}
+
+tune_rf <- function(x, y, inner_fold, seed) {
+  # The grid is defined from a training-only preprocessing fit solely to obtain
+  # the number of nonconstant columns. Every inner fit below re-fits its own
+  # availability filtering, imputation, and zero-variance removal.
+  dimension_keep <- select_training_predictors(x)
+  dimension_prep <- fit_preprocessor(
+    x[dimension_keep],
+    scale = FALSE
+  )
+  grid <- make_rf_grid(length(dimension_prep$keep))
+  grid$inner_auc <- NA_real_
+
+  for (g in seq_len(nrow(grid))) {
+    inner_oof <- rep(NA_real_, nrow(x))
+    for (j in sort(unique(inner_fold))) {
+      tr <- inner_fold != j
+      va <- inner_fold == j
+      inner_keep <- select_training_predictors(x[tr, , drop = FALSE])
+      prep <- fit_preprocessor(
+        x[tr, inner_keep, drop = FALSE],
+        scale = FALSE
+      )
+      x_tr <- apply_preprocessor(
+        prep,
+        x[tr, inner_keep, drop = FALSE]
+      )
+      x_va <- apply_preprocessor(
+        prep,
+        x[va, inner_keep, drop = FALSE]
+      )
+      mtry_value <- min(grid$mtry[[g]], ncol(x_tr))
+      fit <- fit_one_rf(
+        x_tr, y[tr], mtry_value, grid$min.node.size[[g]],
+        seed = seed + 100 * g + j
+      )
+      inner_oof[va] <- predict(
+        fit,
+        data = as.data.frame(x_va)
+      )$predictions[, "1"]
+    }
+    grid$inner_auc[[g]] <- safe_auc(y, inner_oof)
+  }
+
+  grid[which.max(grid$inner_auc), , drop = FALSE]
+}
+
+fit_rf_outer <- function(x_train, y_train, x_test, fold_number) {
+  inner_fold <- make_stratified_folds(
+    y_train,
+    inner_k,
+    seed = 73000 + fold_number
+  )
+  best <- tune_rf(x_train, y_train, inner_fold, seed = 74000 + fold_number)
+  outer_keep <- select_training_predictors(x_train)
+  prep <- fit_preprocessor(x_train[outer_keep], scale = FALSE)
+  x_tr <- apply_preprocessor(prep, x_train[outer_keep])
+  x_te <- apply_preprocessor(prep, x_test[outer_keep])
+  fit <- fit_one_rf(
+    x_tr, y_train,
+    mtry = min(best$mtry[[1]], ncol(x_tr)),
+    min_node = best$min.node.size[[1]],
+    seed = 75000 + fold_number
+  )
+  prediction <- predict(
+    fit,
+    data = as.data.frame(x_te)
+  )$predictions[, "1"]
+  list(
+    prediction = prediction,
+    fit = fit,
+    prep = prep,
+    best = best,
+    n_predictors = ncol(x_tr)
+  )
+}
+
+rf_grid_display <- make_rf_grid(ncol(x_raw))
+rf_grid_display$num.trees <- rf_num_trees
+knitr::kable(
+  rf_grid_display,
+  caption = "Random-forest tuning grid (mtry is capped after fold-specific preprocessing)"
+)
+```
+
+The grid varies both feature subsampling and terminal-node size while keeping
+the search small enough for nested validation. Because selection is based only
+on inner-training AUROC, the outer held-out fold remains an unbiased comparison
+set.
+
+# Fit all models on the shared outer folds
+
+```{r}
+#| label: outer-cv
+
+oof_predictions <- tibble(
+  RecordID = modeling_table$RecordID,
+  truth = y,
+  fold = outer_fold,
+  LASSO = NA_real_,
+  GAM = NA_real_,
+  RandomForest = NA_real_,
+  SAPS_I = modeling_table$SAPS_I,
+  SOFA = modeling_table$SOFA
+)
+
+fold_metrics <- list()
+lasso_selection <- list()
+outer_tuning <- list()
+
+for (fold_number in seq_len(outer_k)) {
+  train_idx <- outer_fold != fold_number
+  test_idx <- outer_fold == fold_number
+  x_train <- x_raw[train_idx, , drop = FALSE]
+  x_test <- x_raw[test_idx, , drop = FALSE]
+  y_train <- y[train_idx]
+  y_test <- y[test_idx]
+
+  lasso_result <- fit_lasso_outer(
+    x_train, y_train, x_test, fold_number
+  )
+  gam_result <- fit_gam_outer(x_train, y_train, x_test)
+  rf_result <- fit_rf_outer(x_train, y_train, x_test, fold_number)
+
+  oof_predictions$LASSO[test_idx] <- lasso_result$prediction
+  oof_predictions$GAM[test_idx] <- gam_result$prediction
+  oof_predictions$RandomForest[test_idx] <- rf_result$prediction
+
+  fold_scores <- list(
+    LASSO = lasso_result$prediction,
+    GAM = gam_result$prediction,
+    RandomForest = rf_result$prediction,
+    SAPS_I = modeling_table$SAPS_I[test_idx],
+    SOFA = modeling_table$SOFA[test_idx]
+  )
+
+  fold_metrics[[fold_number]] <- bind_rows(lapply(
+    names(fold_scores),
+    function(model_name) tibble(
+      fold = fold_number,
+      model = model_name,
+      AUROC = safe_auc(y_test, fold_scores[[model_name]])
+    )
+  ))
+
+  lasso_selection[[fold_number]] <- tibble(
+    fold = fold_number,
+    predictor = lasso_result$selected
+  )
+
+  outer_tuning[[fold_number]] <- tibble(
+    fold = fold_number,
+    lasso_predictors = lasso_result$n_predictors,
+    lasso_lambda = lasso_result$lambda,
+    gam_predictors = gam_result$n_predictors,
+    rf_predictors = rf_result$n_predictors,
+    rf_mtry = rf_result$best$mtry[[1]],
+    rf_min_node_size = rf_result$best$min.node.size[[1]],
+    rf_inner_AUROC = rf_result$best$inner_auc[[1]]
+  )
+}
+
+fold_metrics <- bind_rows(fold_metrics)
+lasso_selection <- bind_rows(lasso_selection)
+outer_tuning <- bind_rows(outer_tuning)
+
+stopifnot(
+  !anyNA(oof_predictions[c("LASSO", "GAM", "RandomForest")]),
+  nrow(fold_metrics) == outer_k * 5L
+)
+
+readr::write_csv(
+  oof_predictions,
+  file.path(out_dir, "cp2_oof_predictions.csv")
+)
+
+knitr::kable(
+  outer_tuning |>
+    mutate(
+      lasso_lambda = signif(lasso_lambda, 3),
+      rf_inner_AUROC = round(rf_inner_AUROC, 3)
+    ),
+  caption = "Hyperparameters selected inside each outer training fold"
+)
+```
+
+This table confirms that predictor availability filtering and tuning were
+repeated within each outer training set. Small differences in predictor counts
+are expected because held-out stays never contribute to the 10% availability
+decision; the selected penalty and random-forest settings also vary by fold.
+
+# LASSO coefficient magnitude and stability
+
+```{r}
+#| label: final-lasso
+
+full_inner_fold <- make_stratified_folds(y, outer_k, seed = 76001)
+final_lasso_tuning <- tune_lasso(x_raw, y, full_inner_fold, lambda_grid)
+final_training_keep <- select_training_predictors(x_raw)
+final_lasso_prep <- fit_preprocessor(
+  x_raw[final_training_keep],
+  scale = TRUE
+)
+final_lasso_x <- apply_preprocessor(
+  final_lasso_prep,
+  x_raw[final_training_keep]
+)
+final_lasso_fit <- glmnet::glmnet(
+  final_lasso_x, y,
+  family = "binomial",
+  alpha = 1,
+  lambda = final_lasso_tuning$lambda,
+  standardize = FALSE
+)
+
+final_lasso_beta <- as.matrix(coef(
+  final_lasso_fit,
+  s = final_lasso_tuning$lambda
+))[, 1]
+
+coefficient_table <- tibble(
+  predictor = names(final_lasso_beta),
+  coefficient = as.numeric(final_lasso_beta)
+) |>
+  filter(predictor != "(Intercept)", coefficient != 0) |>
+  arrange(desc(abs(coefficient)))
+
+stability_table <- lasso_selection |>
+  count(predictor, name = "selected_folds") |>
+  mutate(
+    selection_percent = 100 * selected_folds / outer_k,
+    selected_in_final = predictor %in% coefficient_table$predictor
+  ) |>
+  arrange(desc(selected_folds), desc(selected_in_final), predictor)
+```
+
+The all-set-a LASSO retained `r nrow(coefficient_table)` predictors. Across the
+outer folds, `r sum(stability_table$selected_folds == outer_k)` predictors were
+selected in all five fits. Features selected repeatedly are more stable signals;
+features appearing in only one or two folds should not be interpreted as robust
+clinical discoveries because correlated summaries can substitute for one
+another.
+
+```{r}
+#| label: lasso-coefficient-plot
+#| fig-width: 9
+#| fig-height: 8
+#| fig-cap: "Largest non-zero coefficients from the LASSO refit on all set-a. Predictors were standardized, so coefficient magnitudes are comparable."
+
+coefficient_plot_data <- coefficient_table |>
+  slice_head(n = 30L) |>
+  mutate(predictor = factor(predictor, levels = rev(predictor)))
+
+ggplot(coefficient_plot_data, aes(x = coefficient, y = predictor, fill = coefficient > 0)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0, color = "grey40") +
+  scale_fill_manual(values = c("#3B82A0", "#B84A62")) +
+  labs(
+    x = "Standardized log-odds coefficient",
+    y = NULL,
+    title = "Largest LASSO coefficients"
+  )
+```
+
+The plot shows which standardized features contribute most strongly after
+simultaneous shrinkage. Positive coefficients increase predicted mortality and
+negative coefficients decrease it, conditional on the other retained features;
+they are predictive associations, not causal effects.
+
+```{r}
+#| label: lasso-stability-table
+
+knitr::kable(
+  stability_table |>
+    slice_head(n = 30L),
+  caption = "Thirty most frequently selected LASSO predictors across outer folds"
+)
+```
+
+The table complements the coefficient plot by showing reproducibility across
+patient splits: predictors appearing in all or most folds are more stable than
+those selected only once, although stability still does not imply causality.
+
+# GAM partial effects
+
+```{r}
+#| label: final-gam-and-effects
+
+final_gam_features <- intersect(gam_features, final_training_keep)
+final_gam_prep <- fit_preprocessor(
+  x_raw[final_gam_features],
+  scale = FALSE
+)
+final_gam_x <- apply_preprocessor(
+  final_gam_prep,
+  x_raw[final_gam_features]
+)
+final_gam_formula <- make_gam_formula(
+  intersect(gam_continuous, names(final_gam_x)),
+  intersect(gam_linear, names(final_gam_x))
+)
+final_gam_fit <- mgcv::gam(
+  final_gam_formula,
+  data = data.frame(outcome = y, final_gam_x, check.names = FALSE),
+  family = binomial(),
+  method = "REML",
+  select = TRUE
+)
+
+effect_variables <- intersect(c("Age", "HR_mean", "Temp_mean"), gam_continuous)
+
+make_effect_data <- function(variable) {
+  base_values <- vapply(final_gam_x, median, numeric(1))
+  grid <- seq(
+    quantile(final_gam_x[[variable]], 0.05),
+    quantile(final_gam_x[[variable]], 0.95),
+    length.out = 100
+  )
+  newdata <- as.data.frame(matrix(
+    rep(base_values, each = length(grid)),
+    nrow = length(grid),
+    dimnames = list(NULL, names(base_values))
+  ))
+  newdata[[variable]] <- grid
+  term_prediction <- predict(
+    final_gam_fit,
+    newdata = newdata,
+    type = "terms",
+    se.fit = TRUE
+  )
+  term_name <- grep(
+    paste0("^s\\(", variable, "\\)"),
+    colnames(term_prediction$fit),
+    value = TRUE
+  )[[1]]
+  tibble(
+    predictor = variable,
+    value = grid,
+    centered_log_odds = term_prediction$fit[, term_name],
+    se = term_prediction$se.fit[, term_name],
+    lower = centered_log_odds - 1.96 * se,
+    upper = centered_log_odds + 1.96 * se
+  )
+}
+
+gam_effects <- bind_rows(lapply(effect_variables, make_effect_data))
+
+gam_edf <- as.data.frame(summary(final_gam_fit)$s.table) |>
+  tibble::rownames_to_column("term") |>
+  transmute(
+    term,
+    edf = edf,
+    p_value = `p-value`
+  )
+
+effect_edf <- function(variable) {
+  row <- gam_edf[grepl(paste0("^s\\(", variable, "\\)"), gam_edf$term), ]
+  if (nrow(row) == 0L) return(NA_real_)
+  row$edf[[1]]
+}
+
+shape_label <- function(variable) {
+  e <- gam_effects |> filter(predictor == variable)
+  low <- e$centered_log_odds[[1]]
+  mid <- e$centered_log_odds[[ceiling(nrow(e) / 2)]]
+  high <- e$centered_log_odds[[nrow(e)]]
+  if (low > mid && high > mid) return("a U-shaped pattern")
+  if (low < mid && high < mid) return("an inverted-U pattern")
+  if (high > low) return("an overall increasing pattern")
+  "an overall decreasing pattern"
+}
+```
+
+```{r}
+#| label: gam-partial-effects
+#| fig-width: 10
+#| fig-height: 4.5
+#| fig-cap: "Centered GAM smooths on the log-odds scale. Bands are approximate 95% confidence intervals; other predictors are held at their medians."
+
+effect_labels <- c(
+  Age = "Age (years)",
+  HR_mean = "Mean heart rate",
+  Temp_mean = "Mean temperature"
+)
+
+ggplot(gam_effects, aes(x = value, y = centered_log_odds)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#7AA6C2", alpha = 0.25) +
+  geom_line(color = "#235A7C", linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey45") +
+  facet_wrap(
+    ~ predictor,
+    scales = "free_x",
+    labeller = as_labeller(effect_labels)
+  ) +
+  labs(
+    x = NULL,
+    y = "Centered contribution to log odds of death",
+    title = "Selected non-linear effects in the final GAM"
+  )
+```
+
+Age has an effective degrees of freedom (EDF) of
+`r sprintf('%.2f', effect_edf('Age'))` and shows
+`r shape_label('Age')`. Its EDF is close to one, so the effect is approximately
+linear; increasing risk with age is clinically plausible because physiologic
+reserve generally declines. Mean heart rate has EDF
+`r sprintf('%.2f', effect_edf('HR_mean'))` and shows
+`r shape_label('HR_mean')`. The modest curvature and overall increase are
+clinically plausible because tachycardia can mark physiologic stress, although
+the fitted curve does not show a strong separate rise at the bradycardic end.
+Mean temperature has EDF `r sprintf('%.2f', effect_edf('Temp_mean'))` and shows
+`r shape_label('Temp_mean')`. This is meaningfully non-linear; higher risk at
+the low-temperature end is clinically plausible in severe illness, while the
+expected high-fever upturn is not strongly supported over the central 90% of
+observed values. These statements describe predictive patterns and do not imply
+causal effects.
+
+# 2.7 Model comparison and final choice
+
+```{r}
+#| label: comparison-tables
+
+model_order <- c("LASSO", "GAM", "RandomForest", "SAPS_I", "SOFA")
+
+comparison_summary <- fold_metrics |>
+  mutate(model = factor(model, levels = model_order)) |>
+  group_by(model) |>
+  summarise(
+    mean_AUROC = mean(AUROC),
+    sd_AUROC = sd(AUROC),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mean_AUROC))
+
+comparison_table <- fold_metrics |>
+  mutate(
+    model = factor(model, levels = model_order),
+    Fold = paste0("Fold ", fold),
+    AUROC = round(AUROC, 3)
+  ) |>
+  select(model, Fold, AUROC) |>
+  pivot_wider(names_from = Fold, values_from = AUROC) |>
+  left_join(
+    comparison_summary |>
+      mutate(
+        mean_AUROC = round(mean_AUROC, 3),
+        sd_AUROC = round(sd_AUROC, 3)
+      ),
+    by = "model"
+  ) |>
+  arrange(match(model, model_order))
+
+knitr::kable(
+  comparison_table,
+  caption = "Outer-fold AUROC for the three models and two benchmark scores"
+)
+```
+
+The comparison table places every method on the identical five held-out folds.
+`r as.character(comparison_summary$model[[1]])` has the highest mean AUROC;
+the standard deviations quantify how much discrimination varies across patient
+splits rather than hiding that variation behind a single pooled estimate.
+
+```{r}
+#| label: oof-roc-curves
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: "Receiver operating characteristic curves from out-of-fold predictions. Every stay is scored by a model that was not trained on that stay."
+
+roc_data <- oof_predictions |>
+  pivot_longer(
+    cols = all_of(model_order),
+    names_to = "model",
+    values_to = "score"
+  ) |>
+  group_by(model) |>
+  group_modify(~ {
+    roc_object <- pROC::roc(
+      .x$truth, .x$score,
+      levels = c(0, 1),
+      direction = "<",
+      quiet = TRUE
+    )
+    coords <- pROC::coords(
+      roc_object,
+      x = "all",
+      ret = c("specificity", "sensitivity"),
+      transpose = FALSE
+    )
+    as_tibble(coords)
+  }) |>
+  ungroup() |>
+  mutate(model = factor(model, levels = model_order))
+
+ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_path(linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
+  coord_equal() +
+  labs(
+    x = "False-positive rate",
+    y = "True-positive rate",
+    color = "Model / score",
+    title = "Out-of-fold ROC curves on set-a"
+  )
+```
+
+The out-of-fold receiver operating characteristic curves show that the three
+fitted models separate deaths from survivors substantially better than either
+benchmark across most false-positive rates. Each curve uses predictions made
+for stays that were excluded from the corresponding model fit.
+
+```{r}
+#| label: select-and-refit-final-model
+
+candidate_summary <- comparison_summary |>
+  filter(model %in% c("LASSO", "GAM", "RandomForest")) |>
+  mutate(model = as.character(model))
+
+best_model <- candidate_summary$model[[which.max(candidate_summary$mean_AUROC)]]
+best_auc <- max(candidate_summary$mean_AUROC)
+best_model_sd <- candidate_summary$sd_AUROC[[
+  which.max(candidate_summary$mean_AUROC)
+]]
+lasso_auc <- candidate_summary$mean_AUROC[candidate_summary$model == "LASSO"]
+
+benchmark_summary <- comparison_summary |>
+  filter(model %in% c("SAPS_I", "SOFA")) |>
+  mutate(model = as.character(model))
+best_benchmark_row <- which.max(benchmark_summary$mean_AUROC)
+best_benchmark_name <- benchmark_summary$model[[best_benchmark_row]]
+best_benchmark_auc <- benchmark_summary$mean_AUROC[[best_benchmark_row]]
+best_benchmark_sd <- benchmark_summary$sd_AUROC[[best_benchmark_row]]
+benchmark_gap <- best_auc - best_benchmark_auc
+
+final_model_name <- if (lasso_auc >= best_auc - 0.01) "LASSO" else best_model
+
+# Refit random forest on all set-a so it is available if selected.
+full_rf_inner <- make_stratified_folds(y, inner_k, seed = 77001)
+final_rf_best <- tune_rf(x_raw, y, full_rf_inner, seed = 78001)
+final_rf_prep <- fit_preprocessor(
+  x_raw[final_training_keep],
+  scale = FALSE
+)
+final_rf_x <- apply_preprocessor(
+  final_rf_prep,
+  x_raw[final_training_keep]
+)
+final_rf_fit <- fit_one_rf(
+  final_rf_x, y,
+  mtry = min(final_rf_best$mtry[[1]], ncol(final_rf_x)),
+  min_node = final_rf_best$min.node.size[[1]],
+  seed = 79001
+)
+
+final_object <- switch(
+  final_model_name,
+  LASSO = list(
+    model_name = "LASSO",
+    fit = final_lasso_fit,
+    preprocessor = final_lasso_prep,
+    lambda = final_lasso_tuning$lambda,
+    predictor_columns = names(final_lasso_prep$medians),
+    feature_threshold = rare_measurement_threshold,
+    kept_parameters = kept_parameters
+  ),
+  GAM = list(
+    model_name = "GAM",
+    fit = final_gam_fit,
+    preprocessor = final_gam_prep,
+    gam_features = final_gam_features,
+    predictor_columns = names(final_gam_prep$medians),
+    feature_threshold = rare_measurement_threshold,
+    kept_parameters = kept_parameters
+  ),
+  RandomForest = list(
+    model_name = "RandomForest",
+    fit = final_rf_fit,
+    preprocessor = final_rf_prep,
+    tuning = final_rf_best,
+    predictor_columns = names(final_rf_prep$medians),
+    feature_threshold = rare_measurement_threshold,
+    kept_parameters = kept_parameters
+  )
+)
+
+saveRDS(final_object, file.path(out_dir, "cp2_final_model.rds"))
+
+stopifnot(
+  file.exists(file.path(out_dir, "cp2_final_model.rds")),
+  file.exists(file.path(out_dir, "cp2_oof_predictions.csv"))
+)
+```
+
+The highest mean outer-fold AUROC among the three fitted models was
+`r best_model` (`r sprintf('%.3f', best_auc)`). LASSO achieved
+`r sprintf('%.3f', lasso_auc)`. I selected **`r final_model_name`** as the final
+model: LASSO is preferred when it is within 0.01 AUROC of the best model because
+its sparse standardized coefficients are substantially easier to inspect;
+otherwise the empirically best model is retained. This rule was stated before
+examining set-b or set-c, neither of which is read here.
+
+The strongest benchmark was `r best_benchmark_name`, with mean AUROC
+`r sprintf('%.3f', best_benchmark_auc)` and fold-to-fold standard deviation
+`r sprintf('%.3f', best_benchmark_sd)`. The best fitted model exceeds it by
+`r sprintf('%.3f', benchmark_gap)` AUROC. This gap is
+**`r ifelse(benchmark_gap > max(best_model_sd, best_benchmark_sd), 'larger', 'not larger')`**
+than the larger of the two fold-to-fold standard deviations
+(`r sprintf('%.3f', max(best_model_sd, best_benchmark_sd))`). Therefore,
+`r ifelse(benchmark_gap > max(best_model_sd, best_benchmark_sd),
+  'the improvement over SAPS-I and SOFA is much larger than ordinary fold-to-fold variation in this analysis',
+  'the apparent improvement is not clearly larger than ordinary fold-to-fold variation')`.
+This supports a discrimination advantage on set-a, but it does not establish
+clinical usefulness or external validity; those require Checkpoint 3.
+
+# Output and reproducibility checks
+
+```{r}
+#| label: output-checks
+
+required_outputs <- c(
+  file.path(out_dir, "cp2_final_model.rds"),
+  file.path(out_dir, "cp2_oof_predictions.csv")
+)
+
+stopifnot(
+  all(file.exists(required_outputs)),
+  all(file.info(required_outputs)$size > 0),
+  nrow(oof_predictions) == expected_n,
+  !anyDuplicated(oof_predictions$RecordID)
+)
+
+tibble(
+  Output = basename(required_outputs),
+  `Size (MB)` = round(file.info(required_outputs)$size / 1024^2, 2)
+) |>
+  knitr::kable(caption = "Checkpoint 2 artifacts saved for Checkpoint 3")
+```
+
+The out-of-fold file contains one prediction per stay for all three models and
+both benchmark scores. The saved final-model object contains the fitted model,
+its training-derived preprocessing values, and the feature specification needed
+to apply the same transformation in Checkpoint 3.
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessioninfo::session_info()
+```

@@ -21,6 +21,12 @@ r-here = "*"
 r-readr = "*"
 python = "3.12.*"
 pandas = "*"
+r-glmnet = ">=5.0,<6"
+r-mgcv = ">=1.9_4,<2"
+r-ranger = ">=0.18.0,<0.19"
+r-proc = ">=1.19.1,<2"
+r-tidyverse = ">=2.0.0,<3"
 
 [tasks]
-checkpoint1 = "quarto render checkpoint1.qmd --output-dir output"
+checkpoint1 = "quarto render checkpoint1.qmd --output-dir output --no-clean"
+checkpoint2 = "quarto render checkpoint2.qmd --output-dir output --no-clean"
